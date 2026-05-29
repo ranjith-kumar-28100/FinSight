@@ -1,0 +1,78 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-ink-950 text-slate-100 antialiased;
+    font-feature-settings: "ss01", "cv11", "tnum";
+  }
+  /* Tabular figures for any currency or count */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-ink-700 rounded-full;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-ink-600;
+  }
+}
+
+@layer components {
+  .glass {
+    @apply rounded-2xl border border-line bg-surface backdrop-blur-xl shadow-glass;
+  }
+  .glass-strong {
+    @apply rounded-2xl border border-line bg-surface-strong backdrop-blur-xl shadow-glass;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-medium
+           transition focus:outline-none focus:ring-2 focus:ring-brand-500/60 disabled:opacity-50
+           disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply btn bg-gradient-to-r from-brand-600 to-brand-500 text-white shadow-lg shadow-brand-700/30
+           hover:from-brand-500 hover:to-brand-400;
+  }
+  .btn-ghost {
+    @apply btn border border-line text-slate-300 hover:bg-surface-strong;
+  }
+  .btn-danger {
+    @apply btn border border-loss-500/30 text-loss-400 hover:bg-loss-500/10;
+  }
+  .input {
+    @apply w-full rounded-xl border border-line bg-ink-800/60 px-3 py-2 text-sm text-slate-100
+           placeholder:text-slate-500 focus:border-brand-500 focus:outline-none focus:ring-2
+           focus:ring-brand-500/30;
+  }
+  .label {
+    @apply mb-1 block text-xs font-medium uppercase tracking-wider text-slate-400;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full border border-line bg-surface px-2.5 py-0.5
+           text-xs font-medium text-slate-300;
+  }
+  .chip-gain {
+    @apply chip border-gain-500/30 bg-gain-500/10 text-gain-400;
+  }
+  .chip-loss {
+    @apply chip border-loss-500/30 bg-loss-500/10 text-loss-400;
+  }
+  .chip-gold {
+    @apply chip border-gold-500/30 bg-gold-500/10 text-gold-400;
+  }
+}

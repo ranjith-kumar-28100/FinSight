@@ -1,0 +1,18 @@
+name: genai
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10,<3.11
+  - pandas
+  - openpyxl
+  - xlrd
+  - streamlit
+  - plotly
+  - python-dotenv
+  - pydantic
+  - python-magic
+  - pip
+  - pip:
+    - openai
+    - pdfplumber
