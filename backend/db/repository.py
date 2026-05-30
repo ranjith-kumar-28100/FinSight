@@ -14,12 +14,21 @@ from typing import Optional
 
 from backend.models.transaction import (
     Provenance,
+    RecurringType,
     Transaction,
     TransactionDirection,
     TransactionSource,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_col(row: "sqlite3.Row", name: str):
+    """Read an optional column that may be absent on older DB rows."""
+    try:
+        return row[name] or None
+    except (IndexError, KeyError):
+        return None
 
 
 class TransactionRepository:
@@ -44,11 +53,12 @@ class TransactionRepository:
             INSERT OR IGNORE INTO transactions (
                 txn_id, source, source_ref, date, amount, direction,
                 raw_description, counterparty, enriched_counterparty,
+                upi_id, counterparty_app, txn_time, external_tag,
                 category, subcategory,
                 is_recurring, recurring_type, linked_txn_id, confidence,
                 needs_review, user_label, provenance_file, provenance_row,
                 provenance_sheet
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         rows = []
         for txn in transactions:
@@ -62,6 +72,10 @@ class TransactionRepository:
                 txn.raw_description,
                 txn.counterparty,
                 txn.enriched_counterparty,
+                txn.upi_id,
+                txn.counterparty_app,
+                txn.txn_time,
+                txn.external_tag,
                 txn.category,
                 txn.subcategory,
                 int(txn.is_recurring),
@@ -342,6 +356,54 @@ class TransactionRepository:
         conn = self._connect()
         try:
             conn.execute(sql, (name, bank_txn_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def enrich_bank_row(
+        self,
+        bank_txn_id: str,
+        enriched_counterparty: Optional[str] = None,
+        upi_id: Optional[str] = None,
+        counterparty_app: Optional[str] = None,
+        external_tag: Optional[str] = None,
+        category: Optional[str] = None,
+        subcategory: Optional[str] = None,
+    ) -> None:
+        """Push wallet-derived context onto a linked bank backbone row.
+
+        Only the supplied columns are written. ``upi_id`` / ``counterparty_app``
+        are filled only when the bank row is missing them (COALESCE); the
+        wallet-owned fields (enriched name, tag, adopted category) overwrite.
+        """
+        sets: list[str] = []
+        params: list = []
+        if enriched_counterparty:
+            sets.append("enriched_counterparty = ?")
+            params.append(enriched_counterparty)
+        if upi_id:
+            sets.append("upi_id = COALESCE(NULLIF(upi_id, ''), ?)")
+            params.append(upi_id)
+        if counterparty_app:
+            sets.append("counterparty_app = COALESCE(NULLIF(counterparty_app, ''), ?)")
+            params.append(counterparty_app)
+        if external_tag:
+            sets.append("external_tag = ?")
+            params.append(external_tag)
+        if category:
+            sets.append("category = ?")
+            params.append(category)
+            sets.append("subcategory = ?")
+            params.append(subcategory)
+        if not sets:
+            return
+        params.append(bank_txn_id)
+        conn = self._connect()
+        try:
+            conn.execute(
+                f"UPDATE transactions SET {', '.join(sets)} WHERE txn_id = ?",
+                params,
+            )
             conn.commit()
         finally:
             conn.close()
@@ -805,6 +867,10 @@ class TransactionRepository:
             raw_description=row["raw_description"],
             counterparty=row["counterparty"] or "",
             enriched_counterparty=enriched,
+            upi_id=_safe_col(row, "upi_id"),
+            counterparty_app=_safe_col(row, "counterparty_app"),
+            txn_time=_safe_col(row, "txn_time"),
+            external_tag=_safe_col(row, "external_tag"),
             category=row["category"] or "",
             subcategory=row["subcategory"],
             is_recurring=bool(row["is_recurring"]),

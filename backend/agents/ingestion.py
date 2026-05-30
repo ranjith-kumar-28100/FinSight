@@ -101,6 +101,83 @@ def _parse_decimal(value) -> Optional[Decimal]:
         return None
 
 
+def _norm_ref(value) -> str:
+    """Normalise a UPI reference (RRN) to a bare digit string for cross-source joins.
+
+    The same payment carries the same 12-digit NPCI RRN in every export, but
+    formatted differently per source:
+      - HDFC  Chq./Ref.No. : "0000600199803992"  (zero-padded to 16)
+      - Paytm UPI Ref No.   : 600199803992        (bare, sometimes float)
+      - GPay  UPITransactionID: 600199803992      (bare)
+    Stripping non-digits and leading zeros makes all three comparable.
+    Returns "" for empty/all-zero refs (non-UPI rows like NACH/EMI).
+    """
+    if value is None:
+        return ""
+    # pandas may surface an integer ref as a float ("614760095294.0") or NaN.
+    if isinstance(value, float):
+        if value != value:  # NaN
+            return ""
+        value = format(int(value), "d")
+    s = str(value).strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    return re.sub(r"\D", "", s).lstrip("0")
+
+
+_VPA_RE = re.compile(r"([\w.\-]+@[a-z]+)", re.IGNORECASE)
+
+# Paytm "Transaction Details" verbs to strip when deriving the merchant name.
+_PAYTM_VERB_RE = re.compile(
+    r"^(?:paid to|money sent to|received from|money received from|"
+    r"recharge of|bill payment of|payment to|added to)\s+",
+    re.IGNORECASE,
+)
+# Wallet counterparty handles read "<vpa> on <App>" (PhonePe / Google Pay / Paytm…).
+_ON_APP_RE = re.compile(r"\s+on\s+([A-Za-z][A-Za-z ]+?)\s*$")
+
+
+def _split_handle(other_details: str) -> tuple[Optional[str], Optional[str]]:
+    """Split Paytm 'Other Transaction Details' into (vpa, counterparty_app).
+
+    e.g. 'q428790842@ybl on PhonePe' -> ('q428790842@ybl', 'PhonePe')
+         '9842506824@okbizaxis'      -> ('9842506824@okbizaxis', None)
+    """
+    if not other_details:
+        return None, None
+    text = other_details.strip()
+    app = None
+    m = _ON_APP_RE.search(text)
+    if m:
+        app = m.group(1).strip()
+        text = text[: m.start()].strip()
+    return (text or None), app
+
+
+def _clean_merchant(details: str) -> str:
+    """Strip the leading action verb from a wallet 'paid to / money sent to' label."""
+    if not details:
+        return ""
+    return _PAYTM_VERB_RE.sub("", details.strip()).strip()
+
+
+def _clean_tag(tag: str) -> Optional[str]:
+    """Reduce a Paytm tag like '#\U0001f957 Food' to plain text 'Food'."""
+    if not tag or str(tag).strip().lower() == "nan":
+        return None
+    # Drop '#', emoji and other non-word symbols, keep letters/digits/spaces.
+    cleaned = re.sub(r"[^\w &/]", " ", str(tag)).strip()
+    return cleaned or None
+
+
+def _extract_vpa(text: str) -> Optional[str]:
+    """Pull the first UPI VPA (e.g. 'zepto.payu@axisbank') out of free text."""
+    if not text:
+        return None
+    m = _VPA_RE.search(text)
+    return m.group(1) if m else None
+
+
 def _parse_date(value, formats: Optional[list[str]] = None) -> Optional[date]:
     """Try multiple date formats to parse a date value."""
     if pd.isna(value) or value is None:
@@ -260,12 +337,13 @@ def parse_hdfc(file_path: Path) -> list[Transaction]:
 
             txn = Transaction(
                 source=TransactionSource.BANK,
-                source_ref=ref,
+                source_ref=_norm_ref(ref),  # normalised RRN — the cross-source join key
                 date=txn_date,
                 amount=amount,
                 direction=direction,
                 raw_description=narration,
                 counterparty=counterparty,
+                upi_id=_extract_vpa(narration),
                 provenance=Provenance(
                     source_file=file_path.name,
                     row_index=int(idx),
@@ -432,18 +510,28 @@ def parse_paytm(file_path: Path) -> list[Transaction]:
             if source_dest == "nan":
                 source_dest = ""
 
-            txn_id_raw = str(row.get(col_map.get("txn_id", ""), "")).strip()
-            if txn_id_raw == "nan":
-                txn_id_raw = ""
+            vpa, counterparty_app = _split_handle(source_dest)
+            merchant = _clean_merchant(description) or _extract_counterparty(description)
+
+            txn_time = str(row.get(col_map.get("time", ""), "")).strip()
+            if txn_time == "nan":
+                txn_time = ""
+
+            external_tag = _clean_tag(row.get(col_map.get("tags", ""), ""))
 
             txn = Transaction(
                 source=TransactionSource.PAYTM,
-                source_ref=txn_id_raw,
+                # Paytm "UPI Ref No." is the RRN — normalise it as the join key.
+                source_ref=_norm_ref(row.get(col_map.get("txn_id", ""), "")),
                 date=txn_date,
                 amount=amount,
                 direction=direction,
                 raw_description=description,
-                counterparty=source_dest or _extract_counterparty(description),
+                counterparty=merchant,
+                upi_id=vpa,
+                counterparty_app=counterparty_app,
+                txn_time=txn_time or None,
+                external_tag=external_tag,
                 provenance=Provenance(
                     source_file=file_path.name,
                     row_index=int(idx),
@@ -472,6 +560,11 @@ def _map_paytm_columns(columns: list[str]) -> dict[str, str]:
 
     for col in columns:
         col_lower = col.lower().strip()
+
+        # Time — capture explicitly before the date branch would swallow it.
+        if col_lower == "time":
+            mapping["time"] = col
+            continue
 
         # Date — match "date" but not columns that merely contain "date"
         # as part of a longer phrase like "other transaction details"
@@ -614,13 +707,17 @@ def _parse_gpay_text_lines(lines: list[str], source_file: str) -> list[Transacti
             i += 1
             continue
 
-        # Check the next line for UPI ref
+        # The next line carries "HH:MMPM UPITransactionID:<rrn>"
         upi_ref = ""
+        txn_time = None
         if i + 1 < len(lines):
             next_line = lines[i + 1].strip()
             upi_m = _GPAY_UPI_RE.search(next_line)
             if upi_m:
                 upi_ref = upi_m.group(1)
+            time_m = re.match(r'(\d{1,2}:\d{2}\s*[AP]M)', next_line, re.IGNORECASE)
+            if time_m:
+                txn_time = time_m.group(1)
 
         # Direction from description prefix
         desc_lower = description.lower()
@@ -639,12 +736,13 @@ def _parse_gpay_text_lines(lines: list[str], source_file: str) -> list[Transacti
 
         transactions.append(Transaction(
             source=TransactionSource.GPAY,
-            source_ref=upi_ref,
+            source_ref=_norm_ref(upi_ref),  # GPay UPITransactionID is the RRN
             date=txn_date,
             amount=amount,
             direction=direction,
             raw_description=description,
             counterparty=counterparty[:80],
+            txn_time=txn_time,
             provenance=Provenance(source_file=source_file,
                                   row_index=len(transactions)),
         ))

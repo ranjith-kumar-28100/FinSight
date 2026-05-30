@@ -61,13 +61,18 @@ class Transaction(BaseModel):
 
     txn_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     source: TransactionSource
-    source_ref: str = ""
+    source_ref: str = ""  # normalised UPI RRN (leading zeros stripped) — cross-source join key
     date: date
     amount: Decimal = Field(ge=0)
     direction: TransactionDirection
     raw_description: str
     counterparty: str = ""
     enriched_counterparty: Optional[str] = None
+    # -- Enrichment fields (populated from wallet exports / narration) --------
+    upi_id: Optional[str] = None        # counterparty VPA, e.g. "zepto.payu@axisbank"
+    counterparty_app: Optional[str] = None  # app the counterparty collects on: PhonePe/Google Pay/Paytm
+    txn_time: Optional[str] = None      # HH:MM:SS within the day (wallets carry this; bank does not)
+    external_tag: Optional[str] = None  # user's own category tag from the wallet (Paytm "Tags")
     category: str = ""
     subcategory: Optional[str] = None
     is_recurring: bool = False

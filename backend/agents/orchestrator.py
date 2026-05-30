@@ -23,7 +23,11 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from backend.agents.anomaly import run_anomaly_detection
 from backend.agents.analytics import run_analytics
-from backend.agents.categorisation import REVIEW_THRESHOLD, categorise_by_rules
+from backend.agents.categorisation import (
+    REVIEW_THRESHOLD,
+    categorise_by_rules,
+    categorise_by_tag,
+)
 from backend.agents.ingestion import parse_gpay, parse_hdfc, parse_paytm
 from backend.agents.reconciliation import backfill_enrichment, run_reconciliation
 from backend.agents.recurring import run_recurring_detection
@@ -143,7 +147,10 @@ def _make_categorise_node(config: AzureOpenAIConfig):
         rule_matched = 0
         needs_llm: list[Transaction] = []
         for t in bank_uncategorised:
-            rule = categorise_by_rules(_merchant_text(t))
+            # Wallet tag (copied onto the bank row during reconciliation) is
+            # ground truth; fall back to keyword rules on the enriched merchant.
+            rule = categorise_by_tag(t.external_tag) or categorise_by_rules(
+                _merchant_text(t))
             if rule:
                 repo.set_category(
                     t.txn_id, rule.category, rule.subcategory,
@@ -216,7 +223,8 @@ def _make_categorise_node(config: AzureOpenAIConfig):
                                   conf < REVIEW_THRESHOLD)
                 wallet_inherited += 1
             else:
-                rule = categorise_by_rules(w.counterparty or w.raw_description)
+                rule = categorise_by_tag(w.external_tag) or categorise_by_rules(
+                    w.counterparty or w.raw_description)
                 if rule:
                     repo.set_category(
                         w.txn_id, rule.category, rule.subcategory,

@@ -1,164 +1,195 @@
-"""Reconciliation Agent — links wallet records to the HDFC bank record they
-mirror, and enriches the bank record with the cleaner wallet merchant name.
+"""Reconciliation Agent — joins the three statements into one ledger.
 
-The bank statement is the source of truth for amounts and dates. GPay/Paytm
-records exist only to add merchant context — a single UPI payment shows up in
-the HDFC statement as a cryptic narration (e.g.
-``UPI-ZEPTO MARKETPLACE PR-...PAYU@MAIRTEL``) and on GPay as ``PaidToZepto``.
-Reconciliation finds the pair, links them, and writes the GPay merchant name
-into the bank row's ``enriched_counterparty`` column so the UI can show
-"Zepto" instead of the noisy narration.
+The HDFC bank statement is the **backbone** (the real account: every debit/credit
+with a running balance). GPay and Paytm are app-level views of the UPI subset of
+that ledger. Each UPI payment carries the same NPCI **RRN** in all three exports,
+just formatted differently:
 
-Strategy (driven from the bank side):
-  For each unlinked bank debit, scan unlinked wallet debits within ±2 days
-  with the same amount. Score by UPI-ref overlap and date proximity. Matches
-  with score ≥ 0.85 are auto-linked + enriched. 0.50–0.84 flagged for review.
+    HDFC  Chq./Ref.No.    : "0000600199803992"   (zero-padded)
+    Paytm UPI Ref No.     : 600199803992
+    GPay  UPITransactionID: 600199803992
 
-No LLM — pure rule-based fuzzy matching.
+``ingestion._norm_ref`` strips that to a bare digit string, so the join is exact.
+
+Two tiers:
+  1. **Deterministic (RRN):** wallet row whose normalised ``source_ref`` equals a
+     bank row's ``source_ref`` is the same payment — link with confidence 1.0.
+  2. **Fuzzy fallback:** for wallet rows with no RRN match (format quirks, missing
+     ref), match on amount + direction + date window + merchant/VPA similarity.
+
+When linked, the bank row is enriched with the wallet's *clean* merchant name,
+counterparty VPA, the user's own category tag (Paytm), and — when the bank row is
+weakly categorised — the wallet's category. GPay and Paytm are disjoint (a payment
+goes through one app), so a bank row links to at most one wallet row.
+
+No LLM — pure rule-based.
 """
 
 import logging
 from datetime import timedelta
+from difflib import SequenceMatcher
 
 from backend.db.repository import TransactionRepository
-from backend.models.transaction import Transaction, TransactionDirection
+from backend.models.transaction import Transaction
 
 logger = logging.getLogger(__name__)
 
-HIGH_CONFIDENCE_THRESHOLD = 0.85
-MEDIUM_CONFIDENCE_THRESHOLD = 0.50
-DATE_WINDOW_DAYS = 2
+FUZZY_AUTO_THRESHOLD = 0.85
+FUZZY_REVIEW_THRESHOLD = 0.55
+DATE_WINDOW_DAYS = 3
+_WEAK_CATEGORIES = {"", "Other", "Uncategorised"}
 
 
 def run_reconciliation(repo: TransactionRepository) -> dict:
-    """Reconcile bank debits against wallet (GPay/Paytm) debits.
+    """Join wallet rows onto the bank backbone and enrich the bank rows.
 
-    Returns ``{auto_linked, enriched, queued_for_review, orphan_wallet}``.
+    Returns counts: ``{auto_linked, rrn_linked, fuzzy_linked, enriched,
+    queued_for_review, orphan_wallet}``.
     """
-    bank_debits = [
-        t for t in repo.get_unlinked_by_source("bank")
-        if t.direction == TransactionDirection.DEBIT
-    ]
-    wallet_debits = [
-        t for t in repo.get_unlinked_by_source("gpay") + repo.get_unlinked_by_source("paytm")
-        if t.direction == TransactionDirection.DEBIT
-    ]
+    bank = repo.get_unlinked_by_source("bank")
+    wallet = (
+        repo.get_unlinked_by_source("gpay")
+        + repo.get_unlinked_by_source("paytm")
+    )
 
-    if not bank_debits or not wallet_debits:
+    if not bank or not wallet:
         logger.info(
-            "Reconciliation: bank_debits=%d wallet_debits=%d — nothing to do.",
-            len(bank_debits), len(wallet_debits),
+            "Reconciliation: bank=%d wallet=%d — nothing to do.",
+            len(bank), len(wallet),
         )
-        return {
-            "auto_linked": 0,
-            "enriched": 0,
-            "queued_for_review": 0,
-            "orphan_wallet": len(wallet_debits),
-        }
+        return _summary(0, 0, 0, 0, len(wallet))
 
-    # Index wallet debits by date for O(1) window scans.
-    wallet_by_date: dict[str, list[Transaction]] = {}
-    for w in wallet_debits:
-        wallet_by_date.setdefault(w.date.isoformat(), []).append(w)
+    linked_bank_ids: set[str] = set()
+    rrn_linked = fuzzy_linked = enriched = queued = 0
 
-    claimed_wallet_ids: set[str] = set()
-    auto_linked = 0
-    enriched = 0
-    queued = 0
+    # -- Tier 1: deterministic RRN join -----------------------------------
+    bank_by_ref: dict[str, Transaction] = {}
+    for b in bank:
+        if b.source_ref:  # empty for non-UPI rows (NACH/EMI/card)
+            bank_by_ref.setdefault(b.source_ref, b)
 
-    for bank_txn in bank_debits:
-        candidates: list[tuple[Transaction, float]] = []
+    remaining_wallet: list[Transaction] = []
+    for w in wallet:
+        bank_txn = bank_by_ref.get(w.source_ref) if w.source_ref else None
+        if bank_txn is not None and bank_txn.txn_id not in linked_bank_ids:
+            repo.link_transactions(bank_txn.txn_id, w.txn_id, 1.0)
+            _enrich(repo, bank_txn, w)
+            linked_bank_ids.add(bank_txn.txn_id)
+            rrn_linked += 1
+            enriched += 1
+        else:
+            remaining_wallet.append(w)
+
+    # -- Tier 2: fuzzy fallback (amount + direction + date + merchant) -----
+    bank_by_date: dict[str, list[Transaction]] = {}
+    for b in bank:
+        if b.txn_id not in linked_bank_ids:
+            bank_by_date.setdefault(b.date.isoformat(), []).append(b)
+
+    for w in remaining_wallet:
+        best, best_score = None, 0.0
         for delta in range(-DATE_WINDOW_DAYS, DATE_WINDOW_DAYS + 1):
-            check_date = (bank_txn.date + timedelta(days=delta)).isoformat()
-            for wallet_txn in wallet_by_date.get(check_date, []):
-                if wallet_txn.txn_id in claimed_wallet_ids:
+            day = (w.date + timedelta(days=delta)).isoformat()
+            for b in bank_by_date.get(day, []):
+                if b.txn_id in linked_bank_ids:
                     continue
-                if wallet_txn.amount != bank_txn.amount:
+                if b.amount != w.amount or b.direction != w.direction:
                     continue
-                score = _match_score(bank_txn, wallet_txn, abs(delta))
-                candidates.append((wallet_txn, score))
+                score = _fuzzy_score(b, w, abs(delta))
+                if score > best_score:
+                    best, best_score = b, score
 
-        if not candidates:
-            continue
-
-        best_wallet, best_score = max(candidates, key=lambda x: x[1])
-
-        if best_score >= HIGH_CONFIDENCE_THRESHOLD:
-            repo.link_transactions(
-                bank_txn.txn_id, best_wallet.txn_id, best_score)
-            claimed_wallet_ids.add(best_wallet.txn_id)
-            auto_linked += 1
-            if best_wallet.counterparty:
-                repo.update_enriched_counterparty(
-                    bank_txn.txn_id, best_wallet.counterparty)
-                enriched += 1
-        elif best_score >= MEDIUM_CONFIDENCE_THRESHOLD:
-            repo.flag_anomalies([bank_txn.txn_id, best_wallet.txn_id])
+        if best is not None and best_score >= FUZZY_AUTO_THRESHOLD:
+            repo.link_transactions(best.txn_id, w.txn_id, best_score)
+            _enrich(repo, best, w)
+            linked_bank_ids.add(best.txn_id)
+            fuzzy_linked += 1
+            enriched += 1
+        elif best is not None and best_score >= FUZZY_REVIEW_THRESHOLD:
+            repo.flag_anomalies([w.txn_id])
             queued += 1
 
-    orphan_wallet = len(wallet_debits) - auto_linked
+    orphan = len(wallet) - rrn_linked - fuzzy_linked
     logger.info(
-        "Reconciliation complete: auto_linked=%d enriched=%d queued=%d orphan_wallet=%d",
-        auto_linked, enriched, queued, orphan_wallet,
+        "Reconciliation: rrn=%d fuzzy=%d enriched=%d queued=%d orphan=%d",
+        rrn_linked, fuzzy_linked, enriched, queued, orphan,
     )
-    return {
-        "auto_linked": auto_linked,
-        "enriched": enriched,
-        "queued_for_review": queued,
-        "orphan_wallet": orphan_wallet,
-    }
+    return _summary(rrn_linked, fuzzy_linked, enriched, queued, orphan)
 
 
-def _match_score(bank: Transaction, wallet: Transaction, day_delta: int) -> float:
-    """Score how likely a bank debit and a wallet debit represent the same UPI payment (0–1)."""
-    score = 0.40  # amount already matched
+def _enrich(repo: TransactionRepository, bank: Transaction, wallet: Transaction) -> None:
+    """Copy the wallet's cleaner context onto its bank backbone row."""
+    category = subcategory = None
+    # Adopt the wallet's category only when the bank row is weakly categorised —
+    # "Paid to JMMART" (wallet) categorises far better than "UPI-JMMART-..." (bank).
+    if bank.category in _WEAK_CATEGORIES and wallet.category not in _WEAK_CATEGORIES:
+        category, subcategory = wallet.category, wallet.subcategory
+    repo.enrich_bank_row(
+        bank.txn_id,
+        enriched_counterparty=wallet.counterparty or None,
+        upi_id=wallet.upi_id,
+        counterparty_app=wallet.counterparty_app,
+        external_tag=wallet.external_tag,
+        category=category,
+        subcategory=subcategory,
+    )
 
-    # Date proximity bonus
-    score += max(0.0, 0.30 - day_delta * 0.10)
 
-    # UPI reference overlap: wallet stores the full UPI Transaction ID;
-    # HDFC narration carries it as part of the Chq./Ref.No. field.
-    wallet_ref = wallet.source_ref.strip()
-    bank_ref = bank.source_ref.strip()
-    bank_narration = bank.raw_description or ""
-    if wallet_ref:
-        if (bank_ref and (wallet_ref in bank_ref or bank_ref in wallet_ref)) or (
-            wallet_ref in bank_narration
-        ):
-            score += 0.30
+def _fuzzy_score(bank: Transaction, wallet: Transaction, day_delta: int) -> float:
+    """Likelihood a bank row and wallet row are the same payment (0–1).
 
-    # Counterparty similarity bonus: prefix of the wallet's clean name appears
-    # in the bank narration.
-    wallet_cp = (wallet.counterparty or "").lower().replace(" ", "")
-    bank_narr_norm = bank_narration.lower().replace(" ", "")
-    if wallet_cp and len(wallet_cp) > 3 and wallet_cp[:8] in bank_narr_norm:
-        score += 0.10
+    Amount + direction are already equal before this is called.
+    """
+    score = 0.50
+    score += max(0.0, 0.20 - day_delta * 0.07)  # date proximity
+
+    # VPA match is the strongest soft signal short of the RRN itself.
+    if bank.upi_id and wallet.upi_id and bank.upi_id.lower() == wallet.upi_id.lower():
+        score += 0.30
+    else:
+        score += 0.30 * _name_similarity(bank, wallet)
 
     return min(score, 1.0)
+
+
+def _name_similarity(bank: Transaction, wallet: Transaction) -> float:
+    """Fuzzy similarity between the wallet merchant and the bank narration."""
+    name = (wallet.counterparty or "").lower().replace(" ", "")
+    if not name:
+        return 0.0
+    narration = (bank.raw_description or "").lower().replace(" ", "")
+    if name in narration:
+        return 1.0
+    return SequenceMatcher(None, name, narration).ratio()
+
+
+def _summary(rrn: int, fuzzy: int, enriched: int, queued: int, orphan: int) -> dict:
+    return {
+        "auto_linked": rrn + fuzzy,
+        "rrn_linked": rrn,
+        "fuzzy_linked": fuzzy,
+        "enriched": enriched,
+        "queued_for_review": queued,
+        "orphan_wallet": orphan,
+    }
 
 
 def backfill_enrichment(repo: TransactionRepository) -> int:
     """Populate enriched_counterparty for bank rows already linked to a wallet row.
 
-    Run once on existing databases where reconciliation linked rows under the
-    old (non-enriching) flow. Idempotent — only writes when the bank row is
-    still missing an enriched name.
+    Idempotent — only writes when the bank row is still missing an enriched name.
     """
-    bank_rows = [t for t in repo.get_transactions(
-        bank_only=True) if not t.enriched_counterparty]
-    if not bank_rows:
-        return 0
-
+    bank_rows = [
+        t for t in repo.get_transactions(bank_only=True)
+        if not t.enriched_counterparty
+    ]
     filled = 0
     for bank_txn in bank_rows:
-        wallet_rows = repo.get_wallet_detail_for_bank(bank_txn.txn_id)
-        for w in wallet_rows:
+        for w in repo.get_wallet_detail_for_bank(bank_txn.txn_id):
             if w.counterparty:
-                repo.update_enriched_counterparty(
-                    bank_txn.txn_id, w.counterparty)
+                _enrich(repo, bank_txn, w)
                 filled += 1
                 break
     if filled:
-        logger.info(
-            "Back-filled enriched_counterparty on %d existing bank rows.", filled)
+        logger.info("Back-filled enrichment on %d bank rows.", filled)
     return filled

@@ -21,6 +21,11 @@ CREATE TABLE IF NOT EXISTS transactions (
     direction       TEXT NOT NULL CHECK(direction IN ('debit', 'credit')),
     raw_description TEXT NOT NULL,
     counterparty    TEXT DEFAULT '',
+    enriched_counterparty TEXT,
+    upi_id          TEXT,
+    counterparty_app TEXT,
+    txn_time        TEXT,
+    external_tag    TEXT,
     category        TEXT DEFAULT '',
     subcategory     TEXT,
     is_recurring    INTEGER DEFAULT 0,
@@ -80,6 +85,7 @@ _CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date);",
     "CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category);",
     "CREATE INDEX IF NOT EXISTS idx_transactions_source ON transactions(source);",
+    "CREATE INDEX IF NOT EXISTS idx_transactions_ref ON transactions(source_ref);",
     "CREATE INDEX IF NOT EXISTS idx_transactions_needs_review ON transactions(needs_review);",
     "CREATE INDEX IF NOT EXISTS idx_transactions_linked ON transactions(linked_txn_id);",
     "CREATE INDEX IF NOT EXISTS idx_transactions_recurring ON transactions(is_recurring);",
@@ -90,11 +96,17 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
     """Idempotently add columns that aren't part of older databases."""
     existing = {row[1]
                 for row in conn.execute("PRAGMA table_info(transactions)")}
-    if "enriched_counterparty" not in existing:
-        conn.execute(
-            "ALTER TABLE transactions ADD COLUMN enriched_counterparty TEXT")
-        logger.info(
-            "Migrated transactions table: added enriched_counterparty column.")
+    # Each new column added in its own ALTER so older DBs migrate cleanly.
+    for col in (
+        "enriched_counterparty",
+        "upi_id",
+        "counterparty_app",
+        "txn_time",
+        "external_tag",
+    ):
+        if col not in existing:
+            conn.execute(f"ALTER TABLE transactions ADD COLUMN {col} TEXT")
+            logger.info("Migrated transactions table: added %s column.", col)
 
 
 def init_db(db_path: Path) -> None:

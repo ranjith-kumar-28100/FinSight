@@ -33,7 +33,11 @@ _KEYWORD_RULES: list[tuple[str, str, Optional[str], float]] = [
     (r"\bBONUS\b", "Salary & Income", "Bonus", 0.9),
     (r"\bCASHBACK\b", "Salary & Income", "Cashback", 0.95),
     (r"\bREFUND\b", "Salary & Income", "Refund", 0.9),
-    (r"\bINTEREST\b", "Salary & Income", "Interest Earned", 0.9),
+    # Require bank-interest phrasing — a bare "INTEREST" also appears inside
+    # merchant names / UPI VPAs (e.g. "...LGPINTEREST...") and mis-fires.
+    (r"\b(?:CREDIT\s+INTEREST|INTEREST\s+(?:CREDIT|CAPITALISED|EARNED|PAID)|"
+     r"INT\.?\s*PD|SAVINGS?\s+INTEREST)\b",
+     "Salary & Income", "Interest Earned", 0.9),
     (r"\bDIVIDEND\b", "Salary & Income", "Dividend", 0.9),
 
     # Groceries
@@ -271,6 +275,55 @@ def categorise_by_rules(description: str) -> Optional[CategorisationResult]:
     return None
 
 
+# Paytm "Tags" are the user's own category labels — high-confidence ground truth.
+# Map the clear ones to the canonical taxonomy; vague tags (Miscellaneous,
+# Services, Financial Services) fall through to keyword rules.
+_PAYTM_TAG_MAP: dict[str, tuple[str, Optional[str]]] = {
+    "groceries": ("Groceries", None),
+    "food": ("Dining", None),
+    "money transfer": ("Transfer", "UPI Transfer"),
+    "travel": ("Travel", None),
+    "bill payments": ("Utilities", None),
+    "shopping": ("Shopping", "Online Shopping"),
+    "entertainment": ("Entertainment", None),
+    "fuel": ("Transport", "Fuel"),
+    "taxi": ("Transport", "Cab/Rideshare"),
+    "medical": ("Healthcare", None),
+}
+
+
+def categorise_by_tag(external_tag: Optional[str]) -> Optional[CategorisationResult]:
+    """Categorise from a wallet-supplied tag (e.g. Paytm 'Tags')."""
+    if not external_tag:
+        return None
+    mapped = _PAYTM_TAG_MAP.get(external_tag.strip().lower())
+    if not mapped:
+        return None
+    category, subcategory = mapped
+    return CategorisationResult(
+        category=category,
+        subcategory=subcategory,
+        confidence=0.95,
+        rationale=f"Matched user tag: {external_tag}",
+    )
+
+
+def _categorisation_text(txn: Transaction) -> str:
+    """Best text to categorise on: clean merchant + narration + VPA.
+
+    The wallet merchant ('JMMART') and VPA ('zepto.payu@axisbank') categorise far
+    better than the bank's cryptic narration ('UPI-JMMART-PAYTM...'), so include
+    all of them.
+    """
+    parts = [
+        txn.enriched_counterparty or "",
+        txn.counterparty or "",
+        txn.raw_description or "",
+        txn.upi_id or "",
+    ]
+    return " ".join(p for p in parts if p)
+
+
 def categorise_transactions(
     transactions: list[Transaction],
     llm_provider: Optional[LLMProvider] = None,
@@ -293,9 +346,10 @@ def categorise_transactions(
     categorised = []
     needs_llm: list[tuple[int, Transaction]] = []
 
-    # Tier 1: Rule-based matching
+    # Tier 1: wallet tag (ground truth) → keyword rules on the enriched text
     for i, txn in enumerate(transactions):
-        result = categorise_by_rules(txn.raw_description)
+        result = categorise_by_tag(txn.external_tag) or categorise_by_rules(
+            _categorisation_text(txn))
 
         if result:
             txn = txn.model_copy(update={
